@@ -1,0 +1,56 @@
+from ConfigurationHelpers import get_adls, get_slot, get_submission_id, get_orion_config
+from FactSchemas import fact_appinsights_output, fact_appinsights_schema
+from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import lit,col,explode
+from HelperFunctions import run_actions
+ 
+ 
+spark = SparkSession.builder.getOrCreate()
+ 
+def transform(df_json,LOADTYPE,STARTDATE):
+    df_json = df_json.withColumn("Source", lit("AppInsights"))
+    columns_to_drop=[
+        '_row']
+    df_json = df_json.drop(*columns_to_drop)
+    if LOADTYPE == 'incremental':
+        full_load_file_path = get_adls() + "/Presented/AppInsights/schema_version=1"
+        full_load_df = spark.read.format('delta').load(full_load_file_path)
+        full_load_df.createOrReplaceTempView('full_load_df')
+        query = """
+        select * from full_load_df where timestamp <= date_format(date_add(date_format(to_timestamp('{}', 'yyyy-MM-dd'), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"), -6), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+        """.format(STARTDATE)
+        full_load_trimmed_df = spark.sql(query)
+        df = full_load_trimmed_df.union(df_json)
+    elif LOADTYPE == 'full':
+        df=df_json
+    df = run_actions('App_Analytics', 'Presented', df)
+    df = fact_appinsights_output.apply_to_dataframe(df, cast=True, drop_missing=True)
+    return df
+def readJson(json_file_path):
+    df = spark.read.option("multiline", "true").json(json_file_path)
+    df_exploded = df.select(explode(col("tables")).alias("table"))
+    columns_df = df_exploded.select(col("table.columns").alias("columns"), col("table.rows").alias("rows"))
+    columns_df = columns_df.withColumn("column_names", col("columns.name"))
+    rows_df = columns_df.select(col("column_names"), col("rows"))
+    column_names = rows_df.select(col("column_names")).collect()[0][0]
+    rows_exploded_df = rows_df.withColumn("row", explode(col("rows"))).select("column_names", "row")
+    final_incremental_df = rows_exploded_df.select([col("row")[i].alias(column_name) for i, column_name in enumerate(column_names)])
+    return final_incremental_df
+ 
+def process():
+ 
+    # Paramaters to pass in
+    LOADTYPE = get_orion_config('LoadType')
+    print(LOADTYPE)
+    STARTDATE = get_orion_config('StartDate')
+    print(STARTDATE)
+    json_file_path = get_adls() + "/Landed/AppInsights/"
+    df_json= readJson(json_file_path)
+    df = transform(df_json,LOADTYPE,STARTDATE)
+    file_write_path = get_adls() + "/Presented/AppInsights/schema_version=1"
+    df.write.format('delta') \
+        .option("mergeSchema", "true") \
+        .partitionBy('Source') \
+        .mode("overwrite") \
+        .save(file_write_path)
