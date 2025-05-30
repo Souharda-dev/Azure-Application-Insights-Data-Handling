@@ -2,6 +2,7 @@
 Worked end to end on this project for Diageo using Azure to extract data from KQL Database and move it to production
 
 The Big Picture
+
 Built a system that:
 
 Takes application usage data (from Application Insights/KQL DB)
